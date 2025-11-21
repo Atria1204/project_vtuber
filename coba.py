@@ -1,137 +1,155 @@
 import mediapipe as mp
 import cv2
-import numpy as np # Kita akan butuh numpy untuk operasi gambar
+import numpy as np
+import math
 
-# --- 1. Inisialisasi MediaPipe dan Utilitas ---
+# --- 1. Inisialisasi ---
 mp_drawing = mp.solutions.drawing_utils
 mp_holistic = mp.solutions.holistic
 
-# --- 2. Muat Gambar Avatar ---
-# Ganti 'avatar.png' dengan nama file gambar Anda
-avatar_img_path = 'D:\ITS\sem 5\pcv\projectvtuber\pala.png' 
-try:
-    avatar_original = cv2.imread(avatar_img_path, cv2.IMREAD_UNCHANGED)
-    if avatar_original is None:
-        raise FileNotFoundError(f"File gambar tidak ditemukan: {avatar_img_path}")
-    print(f"Gambar avatar '{avatar_img_path}' berhasil dimuat.")
-except FileNotFoundError as e:
-    print(e)
-    print("Pastikan gambar avatar.png ada di folder yang sama.")
-    exit() # Keluar jika gambar tidak ditemukan
+# --- 2. Load Gambar (WAJIB PNG HORIZONTAL dengan SENDI DI KIRI) ---
+# Pastikan file ini ada di folder yang sama
+file_lengan_atas = 'lengan_atas.png'
+file_lengan_bawah = 'lengan_bawah.png'
 
-# --- 3. Inisialisasi Webcam ---
-cap = cv2.VideoCapture(0)
-if not cap.isOpened():
-    print("Error: Tidak dapat membuka kamera.")
+try:
+    img_lengan_atas = cv2.imread(file_lengan_atas, cv2.IMREAD_UNCHANGED)
+    img_lengan_bawah = cv2.imread(file_lengan_bawah, cv2.IMREAD_UNCHANGED)
+
+    if img_lengan_atas is None:
+        print(f"Error: {file_lengan_atas} tidak ditemukan."); exit()
+    if img_lengan_atas.shape[2] < 4:
+        print("Error: Gambar harus PNG dengan background transparan (4 channel)."); exit()
+
+    if img_lengan_bawah is None: img_lengan_bawah = img_lengan_atas.copy()
+
+except Exception as e:
+    print("Error system saat load gambar:", e)
     exit()
 
-# --- 4. Inisialisasi Holistic Model MediaPipe ---
-with mp_holistic.Holistic(min_detection_confidence=0.5, min_tracking_confidence=0.5) as holistic:
+
+# --- 3. FUNGSI OVERLAY FINAL (MIRROR FIX) ---
+def overlay_limb_final(canvas, img_asset, point_a, point_b, length_factor=1.0, thickness_scale=1.0, mirror=False):
+    if img_asset is None: return canvas
+
+    # A. Hitung Jarak & Sudut
+    dist = math.dist(point_a, point_b)
+    if dist < 5: return canvas
+
+    delta_y = point_b[1] - point_a[1]
+    delta_x = point_b[0] - point_a[0]
+    angle_rad = math.atan2(delta_y, delta_x)
+
+    # B. Siapkan Gambar (Mirroring)
+    # Flip Vertikal (0) untuk tangan kiri vs kanan agar jempol/otot tidak terbalik
+    if mirror:
+        img_used = cv2.flip(img_asset, 0) 
+    else:
+        img_used = img_asset
+
+    # C. Hitung Ukuran Target
+    h_orig, w_orig = img_used.shape[:2]
+    target_width = int(dist * length_factor)
+    target_height = int(h_orig * thickness_scale)
+
+    if target_width < 1 or target_height < 1: return canvas
+
+    # ============================================================
+    # PERUBAHAN UTAMA ADA DI SINI (TITIK TUMPU)
+    # ============================================================
     
+    # D. Tentukan Titik Sumber (Source Points) RELATIF TERHADAP TENGAH GAMBAR
+    # Kita ambil garis tengah (centerline) sebagai poros "tulang"
+    center_y = h_orig * 0.5 
+    
+    src_pts = np.float32([
+        [0, center_y],          # P1: Pivot ada di TENGAH KIRI (bukan (0,0))
+        [w_orig, center_y],     # P2: Ujung ada di TENGAH KANAN
+        [0, h_orig]             # P3: Titik Bawah Kiri (untuk referensi tebal)
+    ])
+
+    # E. Tentukan Titik Tujuan (Destination Points)
+    angle_perpendicular = angle_rad + math.pi / 2
+    
+    # P1' = Ditempel pas di sendi (point_a)
+    dst_p1 = np.array(point_a, dtype=np.float32)
+
+    # P2' = point_a + vektor arah lengan (sepanjang target_width)
+    dst_p2 = dst_p1 + np.array([
+        math.cos(angle_rad) * target_width,
+        math.sin(angle_rad) * target_width
+    ], dtype=np.float32)
+
+    # P3' = point_a + vektor tegak lurus (setengah ketebalan)
+    # Karena src P3 (h_orig) jaraknya adalah 0.5 * tinggi dari P1 (center_y),
+    # Maka dst P3 juga harus berjarak 0.5 * target_height dari dst P1.
+    offset_thickness = target_height * 0.5
+    
+    dst_p3 = dst_p1 + np.array([
+        math.cos(angle_perpendicular) * offset_thickness,
+        math.sin(angle_perpendicular) * offset_thickness
+    ], dtype=np.float32)
+
+    dst_pts = np.float32([dst_p1, dst_p2, dst_p3])
+
+    # F. Transformasi Affine (Warping)
+    M = cv2.getAffineTransform(src_pts, dst_pts)
+    h_c, w_c = canvas.shape[:2]
+    
+    warped_img = cv2.warpAffine(img_used, M, (w_c, h_c),
+                                flags=cv2.INTER_LINEAR,
+                                borderMode=cv2.BORDER_CONSTANT,
+                                borderValue=(0,0,0,0))
+
+    # G. Alpha Blending (Tetap sama)
+    try:
+        alpha_mask = warped_img[:, :, 3] / 255.0
+        alpha_inv = 1.0 - alpha_mask
+        for c in range(3):
+            canvas[:, :, c] = (alpha_inv * canvas[:, :, c] + alpha_mask * warped_img[:, :, c])
+    except Exception:
+        pass 
+
+    return canvas
+
+# --- 4. MAIN LOOP ---
+cap = cv2.VideoCapture(0)
+
+with mp_holistic.Holistic(min_detection_confidence=0.5, min_tracking_confidence=0.5) as holistic:
     while cap.isOpened():
         ret, frame = cap.read()
-        if not ret:
-            print("Error: Tidak dapat membaca frame.")
-            break
-        
-        # Balik frame secara horizontal untuk tampilan cermin
+        if not ret: break
+
         frame = cv2.flip(frame, 1)
+        h, w, _ = frame.shape
 
-        # Recolor Feed (BGR ke RGB) untuk MediaPipe
-        image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        
-        # Buat deteksi dengan MediaPipe
-        results = holistic.process(image)
-        
-        # Recolor image kembali ke BGR untuk ditampilkan
-        image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
-        
-        # --- Bagian VTuber Sederhana: Menempatkan Avatar ---
-        # Kita akan menggunakan koordinat landmark wajah untuk menempatkan avatar
-        
-        # Pastikan landmark wajah terdeteksi
-        if results.face_landmarks:
-            # landmark hidung (index 1 di FACEMESH_CONTOURS)
-            # Anda bisa coba indeks lain seperti 0 (dahi) atau 6 (mulut)
-            nose_landmark = results.face_landmarks.landmark[1] 
-            
-            # Ubah koordinat landmark (normalisasi 0-1) ke koordinat piksel
-            # cv2.cvtColor(image, cv2.COLOR_RGB2BGR) menghasilkan image berukuran sama dengan frame
-            img_h, img_w, _ = image.shape
-            nose_x = int(nose_landmark.x * img_w)
-            nose_y = int(nose_landmark.y * img_h)
-            
-            # --- Menyesuaikan Ukuran Avatar ---
-            # Mari kita buat avatar mengikuti skala wajah (opsional, bisa juga fixed size)
-            # Misalnya, kita asumsikan lebar avatar sekitar 1.5x lebar hidung ke pipi
-            # Untuk sederhana, kita asumsikan lebar avatar konstan dulu.
-            
-            # Tentukan ukuran avatar yang diinginkan (misal, 150x150 piksel)
-            avatar_width = 150
-            avatar_height = 150
-            
-            # Resize avatar
-            avatar_resized = cv2.resize(avatar_original, (avatar_width, avatar_height), interpolation=cv2.INTER_AREA)
-            
-            # Hitung posisi (top-left corner) avatar
-            # Kita ingin hidung ada di tengah bawah avatar, atau di bagian tertentu
-            # Misalnya, letakkan avatar agar bagian bawahnya di hidung, dan tengahnya di hidung
-            
-            # Posisi x: center avatar di hidung
-            x_offset = nose_x - avatar_width // 2
-            # Posisi y: letakkan bagian bawah avatar di hidung
-            y_offset = nose_y - avatar_height 
-            
-            # Pastikan avatar tidak keluar dari batas layar
-            x_offset = max(0, min(x_offset, img_w - avatar_width))
-            y_offset = max(0, min(y_offset, img_h - avatar_height))
-            
-            # --- Menempatkan Avatar ke Frame ---
-            # Kita perlu menumpuk gambar transparan. Ini agak tricky.
-            # Referensi: https://answers.opencv.org/question/25529/how-to-put-a-png-image-with-transparent-background-on-another-image-in-opencv-python/
-            
-            # Ambil bagian frame yang akan ditutupi avatar
-            roi = image[y_offset : y_offset + avatar_height, x_offset : x_offset + avatar_width]
-            
-            # Buat mask dari channel alpha avatar (jika ada)
-            # Jika avatar Anda tidak punya channel alpha (RGBA), Anda perlu buat sendiri
-            if avatar_resized.shape[2] == 4: # RGBA
-                alpha_channel = avatar_resized[:, :, 3]
-                mask = alpha_channel / 255.0
-                alpha_factor = 1.0 - mask
-            else: # RGB, anggap tidak transparan (atau Anda bisa tentukan warna kunci)
-                mask = np.ones((avatar_height, avatar_width), dtype=float)
-                alpha_factor = 0.0 # Tidak ada transparansi, gambar menimpa sepenuhnya
+        image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = holistic.process(image_rgb)
 
-            # Gabungkan gambar (Blending)
-            for c in range(0, 3):
-                # Campurkan RGB channel dari avatar
-                roi[:, :, c] = (alpha_factor * roi[:, :, c] +
-                                mask * avatar_resized[:, :, c])
-            
-        # --- Menggambar Landmark MediaPipe (opsional, bisa dinonaktifkan nanti) ---
-        # Ini adalah kode lama Anda untuk menggambar titik-titik
-        mp_drawing.draw_landmarks(image, results.face_landmarks, mp_holistic.FACEMESH_CONTOURS, 
-                                 mp_drawing.DrawingSpec(color=(80,110,10), thickness=1, circle_radius=1),
-                                 mp_drawing.DrawingSpec(color=(80,256,121), thickness=1, circle_radius=1)
-                                 )
-        mp_drawing.draw_landmarks(image, results.right_hand_landmarks, mp_holistic.HAND_CONNECTIONS, 
-                                 mp_drawing.DrawingSpec(color=(80,22,10), thickness=2, circle_radius=4),
-                                 mp_drawing.DrawingSpec(color=(80,44,121), thickness=2, circle_radius=2)
-                                 )
-        mp_drawing.draw_landmarks(image, results.left_hand_landmarks, mp_holistic.HAND_CONNECTIONS, 
-                                 mp_drawing.DrawingSpec(color=(121,22,76), thickness=2, circle_radius=4),
-                                 mp_drawing.DrawingSpec(color=(121,44,250), thickness=2, circle_radius=2)
-                                 )
-        mp_drawing.draw_landmarks(image, results.pose_landmarks, mp_holistic.POSE_CONNECTIONS, 
-                                 mp_drawing.DrawingSpec(color=(245,117,66), thickness=2, circle_radius=4),
-                                 mp_drawing.DrawingSpec(color=(245,66,230), thickness=2, circle_radius=2)
-                                 )
-                                 
-        cv2.imshow('VTuber Sederhana', image)
+        if results.pose_landmarks:
+            lm = results.pose_landmarks.landmark
+            def p(idx): return (int(lm[idx].x * w), int(lm[idx].y * h))
 
-        if cv2.waitKey(10) & 0xFF == ord('q'):
-            break
+            # ==========================================
+            # SETTINGAN (TUNING)
+            # ==========================================
+            SET_PANJANG = 1.2
+            SET_TEBAL = 0.4
+
+            # --- TANGAN KANAN (PAKAI MIRROR = True) ---
+            # Bahu Kanan(12) -> Siku Kanan(14)
+            frame = overlay_limb_final(frame, img_lengan_atas, p(12), p(14), SET_PANJANG, SET_TEBAL, mirror=False)
+            # Siku Kanan(14) -> Pergelangan Kanan(16)
+            frame = overlay_limb_final(frame, img_lengan_bawah, p(14), p(16), SET_PANJANG, SET_TEBAL, mirror=False)
+
+            # --- TANGAN KIRI (PAKAI MIRROR = False) ---
+            # Bahu Kiri(11) -> Siku Kiri(13)
+            frame = overlay_limb_final(frame, img_lengan_atas, p(11), p(13), SET_PANJANG, SET_TEBAL, mirror=True)
+            # Siku Kiri(13) -> Pergelangan Kiri(15)
+            frame = overlay_limb_final(frame, img_lengan_bawah, p(13), p(15), SET_PANJANG, SET_TEBAL, mirror=True)
+
+        cv2.imshow('VTuber Final Tracking', frame)
+        if cv2.waitKey(5) & 0xFF == ord('q'): break
 
 cap.release()
 cv2.destroyAllWindows()

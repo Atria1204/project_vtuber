@@ -87,6 +87,6 @@ Silakan ubah nilai *float* pada variabel-variabel berikut sesuai kebutuhan:
 
 > **Tips:** Lakukan perubahan nilai sedikit demi sedikit (misal: dari `1.0` ke `1.1`) sambil menjalankan program untuk melihat hasilnya secara langsung.
 
-## ⚙️ Video Demo
+## Video Demo
 
 * https://drive.google.com/file/d/1Wy8s-3_3fLv6iMir11m1_YV79lLsVsZl/view?usp=sharing
